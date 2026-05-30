@@ -1,6 +1,9 @@
 import os
+import re
 import sqlite3
 import logging
+from difflib import SequenceMatcher
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -17,77 +20,84 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("media-cms")
 
 # ================= DB =================
 
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cur = conn.cursor()
+db = sqlite3.connect("cms.db", check_same_thread=False)
+cur = db.cursor()
 
 cur.execute("CREATE TABLE IF NOT EXISTS sources (name TEXT PRIMARY KEY)")
 cur.execute("CREATE TABLE IF NOT EXISTS targets (name TEXT PRIMARY KEY)")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS mapping (
-    source TEXT,
-    target TEXT
-)
-""")
-conn.commit()
+cur.execute("CREATE TABLE IF NOT EXISTS mapping (source TEXT, target TEXT)")
+cur.execute("CREATE TABLE IF NOT EXISTS blacklist (word TEXT)")
+cur.execute("CREATE TABLE IF NOT EXISTS memory (text TEXT)")
+db.commit()
 
 # ================= SECURITY =================
 
 def is_owner(update: Update):
     return update.effective_user.id == OWNER_ID
 
-# ================= DB HELPERS =================
+# ================= CLEANING =================
 
-def add_source(name):
-    cur.execute("INSERT OR IGNORE INTO sources VALUES (?)", (name,))
-    conn.commit()
+def clean(text: str):
+    text = re.sub(r"http\S+", "", text)
+    text = re.sub(r"@\w+", "", text)
+    text = re.sub(r"#\w+", "", text)
+    return text.strip()
 
-def add_target(name):
-    cur.execute("INSERT OR IGNORE INTO targets VALUES (?)", (name,))
-    conn.commit()
+# ================= REWRITE =================
 
-def bind(source, target):
-    cur.execute("INSERT INTO mapping VALUES (?, ?)", (source, target))
-    conn.commit()
+def rewrite(text: str):
+    rules = {
+        "فوری": "خبر فوری",
+        "اختصاصی": "گزارش اختصاصی",
+        "تکمیلی": "به‌روزرسانی",
+    }
+    for k, v in rules.items():
+        text = text.replace(k, v)
+    return text
 
-def unbind(source, target):
-    cur.execute("DELETE FROM mapping WHERE source=? AND target=?", (source, target))
-    conn.commit()
+# ================= DUPLICATE =================
 
-def get_sources():
-    return [r[0] for r in cur.execute("SELECT name FROM sources")]
+def is_duplicate(text: str):
+    rows = cur.execute("SELECT text FROM memory ORDER BY ROWID DESC LIMIT 50").fetchall()
 
-def get_targets():
-    return [r[0] for r in cur.execute("SELECT name FROM targets")]
+    for (old,) in rows:
+        if SequenceMatcher(None, text, old).ratio() > 0.88:
+            return True
+    return False
 
-def get_map():
-    return cur.execute("SELECT source, target FROM mapping").fetchall()
+def save_memory(text: str):
+    cur.execute("INSERT INTO memory VALUES (?)", (text,))
+    db.commit()
+
+# ================= ROUTING =================
+
+def get_targets(source):
+    rows = cur.execute("SELECT target FROM mapping WHERE source=?", (source,)).fetchall()
+    return [r[0] for r in rows]
 
 # ================= PANEL UI =================
 
-def main_menu():
+def panel():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Source", callback_data="add_source")],
-        [InlineKeyboardButton("🎯 Add Target", callback_data="add_target")],
+        [InlineKeyboardButton("➕ Source", callback_data="add_source")],
+        [InlineKeyboardButton("🎯 Target", callback_data="add_target")],
         [InlineKeyboardButton("🔗 Bind", callback_data="bind")],
-        [InlineKeyboardButton("❌ Unbind", callback_data="unbind")],
-        [InlineKeyboardButton("📋 Show Map", callback_data="show_map")]
+        [InlineKeyboardButton("📊 Map", callback_data="map")],
     ])
 
-# ================= COMMAND =================
+# ================= START =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
 
-    await update.message.reply_text(
-        "📊 Mapping Panel",
-        reply_markup=main_menu()
-    )
+    await update.message.reply_text("Media CMS Panel", reply_markup=panel())
 
-# ================= CALLBACK HANDLER =================
+# ================= CALLBACK =================
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -96,62 +106,45 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
 
-    data = q.data
+    if q.data == "map":
+        rows = cur.execute("SELECT * FROM mapping").fetchall()
+        text = "\n".join([f"{s} → {t}" for s, t in rows]) or "empty"
+        await q.edit_message_text(text, reply_markup=panel())
 
-    if data == "show_map":
-        m = get_map()
-        text = "\n".join([f"{s} → {t}" for s, t in m]) or "empty"
-        await q.edit_message_text(text, reply_markup=main_menu())
+    else:
+        context.user_data["mode"] = q.data
+        await q.edit_message_text(f"Send data for: {q.data}")
 
-    elif data == "add_source":
-        context.user_data["mode"] = "add_source"
-        await q.edit_message_text("Send source channel username")
+# ================= INPUT =================
 
-    elif data == "add_target":
-        context.user_data["mode"] = "add_target"
-        await q.edit_message_text("Send target channel username")
-
-    elif data == "bind":
-        context.user_data["mode"] = "bind"
-        await q.edit_message_text("Send: source,target")
-
-    elif data == "unbind":
-        context.user_data["mode"] = "unbind"
-        await q.edit_message_text("Send: source,target")
-
-# ================= TEXT INPUT =================
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
 
     mode = context.user_data.get("mode")
-    text = update.message.text.strip()
+    msg = update.message.text.strip()
 
     if mode == "add_source":
-        add_source(text)
-        await update.message.reply_text("Source added ✔")
+        cur.execute("INSERT OR IGNORE INTO sources VALUES (?)", (msg,))
+        db.commit()
+        await update.message.reply_text("Source added")
 
     elif mode == "add_target":
-        add_target(text)
-        await update.message.reply_text("Target added ✔")
+        cur.execute("INSERT OR IGNORE INTO targets VALUES (?)", (msg,))
+        db.commit()
+        await update.message.reply_text("Target added")
 
     elif mode == "bind":
-        s, t = text.split(",")
-        bind(s.strip(), t.strip())
-        await update.message.reply_text("Bound ✔")
-
-    elif mode == "unbind":
-        s, t = text.split(",")
-        unbind(s.strip(), t.strip())
-        await update.message.reply_text("Unbound ✔")
+        s, t = msg.split(",")
+        cur.execute("INSERT INTO mapping VALUES (?,?)", (s.strip(), t.strip()))
+        db.commit()
+        await update.message.reply_text("Bound")
 
     context.user_data["mode"] = None
 
-# ================= ROUTING ENGINE =================
+# ================= CORE PIPELINE =================
 
-async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.effective_message
     chat = update.effective_chat
@@ -159,17 +152,32 @@ async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    source = chat.username
+    source = chat.username or str(chat.id)
     text = msg.text
 
-    routes = get_map()
+    # clean
+    text = clean(text)
 
-    for s, t in routes:
-        if s == source:
-            await context.bot.send_message(
-                chat_id=t,
-                text=text
-            )
+    if not text:
+        return
+
+    # rewrite
+    text = rewrite(text)
+
+    # duplicate filter
+    if is_duplicate(text):
+        return
+
+    save_memory(text)
+
+    # routing
+    targets = get_targets(source)
+
+    for t in targets:
+        try:
+            await context.bot.send_message(chat_id=t, text=text)
+        except Exception as e:
+            logger.error(e)
 
 # ================= MAIN =================
 
@@ -178,10 +186,10 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.ALL, text_handler))
-    app.add_handler(MessageHandler(filters.ALL, handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
+    app.add_handler(MessageHandler(filters.TEXT, forward))
 
-    print("Bot running...")
+    print("CMS Bot Running...")
     app.run_polling()
 
 if __name__ == "__main__":
