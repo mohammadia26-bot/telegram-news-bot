@@ -1,104 +1,62 @@
-import re
 import os
-import asyncio
 import logging
-from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-# =========================
-# CONFIG (Railway ENV)
-# =========================
+# ================= CONFIG =================
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
-
-SESSION_NAME = "news_session"
-
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@your_channel")
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL")
 
 SOURCE_CHANNELS = os.getenv("SOURCE_CHANNELS", "").split(",")
 
 SIGNATURE = "\n\n🆔 @your_channel"
 
-# =========================
-# LOGGING
-# =========================
-
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# ================= CLEAN =================
 
-# =========================
-# CLEAN TEXT
-# =========================
+def clean_text(text: str):
+    return text
 
-def clean_text(text: str) -> str:
-    text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'@\w+', '', text)
-    text = re.sub(r'#\w+', '', text)
-    return text.strip()
-
-# =========================
-# FORMAT
-# =========================
-
-def format_post(text: str, source: str) -> str:
+def format_post(text: str, source: str):
     return f"{text}\n\n🟣 منبع: {source}{SIGNATURE}"
 
-# =========================
-# PUBLISH
-# =========================
+# ================= HANDLER =================
 
-async def publish(msg, media=None):
-    try:
-        if media:
-            await client.send_file(TARGET_CHANNEL, media, caption=msg)
-        else:
-            await client.send_message(TARGET_CHANNEL, msg)
+async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    except FloodWaitError as e:
-        await asyncio.sleep(e.seconds)
+    msg = update.effective_message
+    chat = update.effective_chat
 
-# =========================
-# HANDLER
-# =========================
+    if not msg or not msg.text:
+        return
 
-@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
-async def handler(event):
+    text = clean_text(msg.text)
 
-    try:
-        text = event.message.message
-        if not text:
-            return
+    source = chat.title or "Unknown"
 
-        # فقط متن تمیز
-        cleaned = clean_text(text)
+    final_text = format_post(text, source)
 
-        # اسم کانال بدون لینک و @
-        source = event.chat.title or "نامشخص"
+    await context.bot.send_message(
+        chat_id=TARGET_CHANNEL,
+        text=final_text
+    )
 
-        final = format_post(cleaned, source)
+# ================= START =================
 
-        if event.message.media:
-            media = await event.message.download_media()
-            await publish(final, media)
-        else:
-            await publish(final)
+def main():
 
-        logger.info(f"Posted from: {source}")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    except Exception as e:
-        logger.error(e)
+    app.add_handler(
+        MessageHandler(filters.ALL & filters.Chat(SOURCE_CHANNELS), handler)
+    )
 
-# =========================
-# MAIN
-# =========================
+    print("Bot started...")
 
-async def main():
-    logger.info("Bot started...")
-    await client.run_until_disconnected()
+    app.run_polling()
 
-with client:
-    client.loop.run_until_complete(main())
+if __name__ == "__main__":
+    main()
